@@ -1,0 +1,1 @@
+với 1 ảnh đầu vào => cho qua trellis đã được training => file 3d .ply
