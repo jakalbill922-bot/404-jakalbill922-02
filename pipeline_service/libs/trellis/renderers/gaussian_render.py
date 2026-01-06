@@ -1,14 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 import torch
 import math
 from easydict import EasyDict as edict
@@ -16,24 +5,14 @@ import numpy as np
 from ..representations.gaussian import Gaussian
 from .sh_utils import eval_sh
 import torch.nn.functional as F
-from easydict import EasyDict as edict
 
 
-def intrinsics_to_projection(
+def compute_projection_matrix(
         intrinsics: torch.Tensor,
         near: float,
         far: float,
     ) -> torch.Tensor:
-    """
-    OpenCV intrinsics to OpenGL perspective matrix
-
-    Args:
-        intrinsics (torch.Tensor): [3, 3] OpenCV intrinsics matrix
-        near (float): near plane to clip
-        far (float): far plane to clip
-    Returns:
-        (torch.Tensor): [4, 4] OpenGL perspective matrix
-    """
+   
     fx, fy = intrinsics[0, 0], intrinsics[1, 1]
     cx, cy = intrinsics[0, 2], intrinsics[1, 2]
     ret = torch.zeros((4, 4), dtype=intrinsics.dtype, device=intrinsics.device)
@@ -47,28 +26,25 @@ def intrinsics_to_projection(
     return ret
 
 
-def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    # lazy import
+def render_gaussians(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     if 'GaussianRasterizer' not in globals():
         from diff_gaussian_rasterization import GaussianRasterizer, GaussianRasterizationSettings
     
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True)
     try:
         screenspace_points.retain_grad()
     except:
         pass
-    # Set up rasterization configuration
+
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     
     kernel_size = pipe.kernel_size
-    subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
+    subpixel_offset = torch.zeros(
+        (int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2),
+        dtype=torch.float32,
+        device=pc.get_xyz.device,
+    )
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -93,8 +69,6 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
     means2D = screenspace_points
     opacity = pc.get_opacity
 
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
     scales = None
     rotations = None
     cov3D_precomp = None
@@ -104,8 +78,6 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
     if override_color is None:
@@ -120,7 +92,6 @@ def render(viewpoint_camera, pc : Gaussian, pipe, bg_color : torch.Tensor, scali
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -148,7 +119,7 @@ class GaussianRenderer:
         rendering_options (dict): Rendering options.
     """
 
-    def __init__(self, rendering_options={}) -> None:
+    def __init__(self, rendering_options={}, device='cuda') -> None:
         self.pipe = edict({
             "kernel_size": 0.1,
             "convert_SHs_python": False,
@@ -165,6 +136,7 @@ class GaussianRenderer:
         })
         self.rendering_options.update(rendering_options)
         self.bg_color = None
+        self.device = device
     
     def render(
             self,
@@ -173,33 +145,21 @@ class GaussianRenderer:
             intrinsics: torch.Tensor,
             colors_overwrite: torch.Tensor = None
         ) -> edict:
-        """
-        Render the gausssian.
-
-        Args:
-            gaussian : gaussianmodule
-            extrinsics (torch.Tensor): (4, 4) camera extrinsics
-            intrinsics (torch.Tensor): (3, 3) camera intrinsics
-            colors_overwrite (torch.Tensor): (N, 3) override color
-
-        Returns:
-            edict containing:
-                color (torch.Tensor): (3, H, W) rendered color image
-        """
+       
         resolution = self.rendering_options["resolution"]
         near = self.rendering_options["near"]
         far = self.rendering_options["far"]
         ssaa = self.rendering_options["ssaa"]
         
         if self.rendering_options["bg_color"] == 'random':
-            self.bg_color = torch.zeros(3, dtype=torch.float32, device="cuda")
+            self.bg_color = torch.zeros(3, dtype=torch.float32, device=self.device)
             if np.random.rand() < 0.5:
                 self.bg_color += 1
         else:
-            self.bg_color = torch.tensor(self.rendering_options["bg_color"], dtype=torch.float32, device="cuda")
+            self.bg_color = torch.tensor(self.rendering_options["bg_color"], dtype=torch.float32, device=self.device)
 
         view = extrinsics
-        perspective = intrinsics_to_projection(intrinsics, near, far)
+        perspective = compute_projection_matrix(intrinsics, near, far)
         camera = torch.inverse(view)[:3, 3]
         focalx = intrinsics[0, 0]
         focaly = intrinsics[1, 1]
@@ -220,7 +180,7 @@ class GaussianRenderer:
         })
 
         # Render
-        render_ret = render(camera_dict, gausssian, self.pipe, self.bg_color, override_color=colors_overwrite, scaling_modifier=self.pipe.scale_modifier)
+        render_ret = render_gaussians(camera_dict, gausssian, self.pipe, self.bg_color, override_color=colors_overwrite, scaling_modifier=self.pipe.scale_modifier)
 
         if ssaa > 1:
             render_ret.render = F.interpolate(render_ret.render[None], size=(resolution, resolution), mode='bilinear', align_corners=False, antialias=True).squeeze()

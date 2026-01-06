@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from plyfile import PlyData, PlyElement
-from .general_utils import inverse_sigmoid, strip_symmetric, build_scaling_rotation
+from .general_utils import compute_inverse_sigmoid, extract_symmetric_elements, build_scaled_rotation_matrices
 import utils3d
 
 
@@ -44,9 +44,9 @@ class Gaussian:
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            L = build_scaled_rotation_matrices(scaling_modifier * scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
+            symm = extract_symmetric_elements(actual_covariance)
             return symm
         
         if self.scaling_activation_type == "exp":
@@ -59,7 +59,7 @@ class Gaussian:
         self.covariance_activation = build_covariance_from_scaling_rotation
 
         self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
+        self.inverse_opacity_activation = compute_inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
         
@@ -126,7 +126,7 @@ class Gaussian:
         xyz = self.get_xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = inverse_sigmoid(self.get_opacity).detach().cpu().numpy()
+        opacities = compute_inverse_sigmoid(self.get_opacity).detach().cpu().numpy()
         scale = torch.log(self.get_scaling).detach().cpu().numpy()
         rotation = (self._rotation + self.rots_bias[None, :]).detach().cpu().numpy()
         
